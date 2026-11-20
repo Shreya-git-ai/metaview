@@ -23,6 +23,7 @@ _TOP_LEVEL_FIELDS = {
     "event",
     "health_state",
     "alert_context",
+    "affected_services",
 }
 _METRIC_RANGES: dict[str, tuple[float, float]] = {
     "cpu_pct": (0.0, 100.0),
@@ -31,6 +32,15 @@ _METRIC_RANGES: dict[str, tuple[float, float]] = {
     "packet_loss_pct": (0.0, 100.0),
     "disk_pct": (0.0, 100.0),
     "bandwidth_mbps": (0.0, 1_000_000_000.0),
+    "up": (0.0, 1.0),
+    "req_count": (0.0, 1_000_000_000_000.0),
+    "err_count": (0.0, 1_000_000_000_000.0),
+    "resp_ms": (0.0, 86_400_000.0),
+    "db_up": (0.0, 1.0),
+    "db_conn_active": (0.0, 1_000_000.0),
+    "db_conn_max": (0.0, 1_000_000.0),
+    "db_size_mb": (0.0, 1_000_000_000_000.0),
+    "db_conn_errors": (0.0, 1_000_000_000.0),
 }
 _EVENT_TYPES = {
     "cpu_anomaly",
@@ -39,10 +49,16 @@ _EVENT_TYPES = {
     "packet_loss_anomaly",
     "auth_failures",
     "secret_redacted",
+    "db_unavailable",
+    "db_recovered",
+    "service_down",
+    "db_conn_saturation",
+    "error_rate_spike",
 }
 _SEVERITIES = {"info", "low", "medium", "high", "critical"}
 _CATEGORIES = {"infra", "network", "security", "collector"}
 _HEALTH_STATES = {"Excellent", "Good", "Fair", "Poor"}
+_AFFECTED_SERVICES = {"banking-app", "payment-service", "postgres"}
 _UTC_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
 
 
@@ -62,6 +78,7 @@ def build_payload(
     event: dict[str, Any] | None = None,
     health_state: str | None = None,
     alert_context: str | None = None,
+    affected_services: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build a candidate payload using configured identity and a pseudonymous source."""
     candidate: dict[str, Any] = {
@@ -83,6 +100,8 @@ def build_payload(
     if alert_context is not None:
         clean_context, _ = redact_text(alert_context)
         candidate["alert_context"] = clean_context[:120]
+    if affected_services is not None:
+        candidate["affected_services"] = affected_services
     return candidate
 
 
@@ -107,7 +126,13 @@ def _valid_metric_value(name: str, value: Any) -> bool:
     bounds = _METRIC_RANGES.get(name)
     if bounds is None or isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    return bounds[0] <= value <= bounds[1]
+    if not bounds[0] <= value <= bounds[1]:
+        return False
+    if name in {"up", "db_up"}:
+        return value in (0, 1)
+    if name in {"req_count", "err_count", "db_conn_active", "db_conn_max", "db_conn_errors"}:
+        return float(value).is_integer()
+    return True
 
 
 def _clean_metrics(value: Any, dropped: list[dict[str, str]]) -> dict[str, int | float] | None:
@@ -152,6 +177,25 @@ def _clean_event(value: Any, dropped: list[dict[str, str]]) -> dict[str, Any] | 
         clean["count"] = count
     elif "count" in value:
         _drop(dropped, "event.count", "wrong_type_or_out_of_range")
+    return clean
+
+
+def _clean_affected_services(value: Any, dropped: list[dict[str, str]]) -> list[str] | None:
+    """Keep recognized service names, dropping unknown or excess entries."""
+    if not isinstance(value, list):
+        _drop(dropped, "affected_services", "wrong_type")
+        return None
+    clean: list[str] = []
+    for index, service in enumerate(value):
+        field = f"affected_services[{index}]"
+        if not isinstance(service, str) or service not in _AFFECTED_SERVICES:
+            _drop(dropped, field, "unknown_service")
+        elif service in clean:
+            _drop(dropped, field, "duplicate_value")
+        elif len(clean) >= 3:
+            _drop(dropped, field, "out_of_range")
+        else:
+            clean.append(service)
     return clean
 
 
@@ -204,6 +248,11 @@ def apply_allowlist(candidate: dict[str, Any]) -> tuple[dict[str, Any], list[dic
         event = _clean_event(candidate["event"], dropped)
         if event is not None:
             clean["event"] = event
+
+    if "affected_services" in candidate:
+        services = _clean_affected_services(candidate["affected_services"], dropped)
+        if services is not None:
+            clean["affected_services"] = services
 
     health = candidate.get("health_state")
     if isinstance(health, str) and health in _HEALTH_STATES:

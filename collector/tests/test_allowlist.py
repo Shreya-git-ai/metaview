@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import config
 from allowlist import apply_allowlist, build_payload
+from redact import redact_text
 
 
 def _candidate(**updates: object) -> dict[str, object]:
@@ -87,3 +89,54 @@ def test_build_payload_redacts_and_truncates_context() -> None:
     assert clean["event"]["type"] == "secret_redacted"
     assert len(clean["alert_context"]) == 120
     assert "secret" not in clean["alert_context"]
+
+
+def test_customer_service_fields_are_allowed_and_unknown_service_is_dropped() -> None:
+    candidate = _candidate(
+        metrics={
+            "cpu_pct": 31.0,
+            "disk_pct": 65.0,
+            "up": 1,
+            "req_count": 500,
+            "err_count": 2,
+            "resp_ms": 25.5,
+            "db_up": 1,
+            "db_conn_active": 20,
+            "db_conn_max": 100,
+            "db_size_mb": 4096.0,
+            "db_conn_errors": 0,
+        },
+        event={"type": "db_unavailable", "severity": "high", "count": 1},
+        affected_services=["postgres", "banking-app", "payment-service"],
+    )
+    clean, dropped = apply_allowlist(candidate)
+    assert dropped == []
+    assert clean["affected_services"] == ["postgres", "banking-app", "payment-service"]
+    unknown, unknown_dropped = apply_allowlist(_candidate(affected_services=["banking-app", "unapproved-service"]))
+    assert unknown["affected_services"] == ["banking-app"]
+    assert {"field": "affected_services[1]", "reason": "unknown_service"} in unknown_dropped
+
+
+def test_new_clean_fields_survive_final_redaction_check() -> None:
+    clean, dropped = apply_allowlist(
+        _candidate(
+            metrics={
+                "up": 1,
+                "req_count": 100,
+                "err_count": 3,
+                "resp_ms": 80.5,
+                "db_up": 1,
+                "db_conn_active": 60,
+                "db_conn_max": 100,
+                "db_size_mb": 9216.25,
+                "db_conn_errors": 0,
+                "disk_pct": 45.0,
+            },
+            event={"type": "db_conn_saturation", "severity": "medium", "count": 1},
+            affected_services=["postgres"],
+        )
+    )
+    serialized = json.dumps(clean, sort_keys=True)
+    redacted, _ = redact_text(serialized)
+    assert dropped == []
+    assert redacted == serialized

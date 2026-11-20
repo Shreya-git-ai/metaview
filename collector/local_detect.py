@@ -61,6 +61,137 @@ class LocalDetector:
         self._baselines: dict[tuple[str, str], deque[float]] = defaultdict(lambda: deque(maxlen=self.baseline_window))
         self._failures: dict[str, deque[float]] = defaultdict(deque)
         self._last_auth_event: dict[str, float] = {}
+        self._db_down_consecutive = 0
+        self._db_down_active = False
+        self._service_down_consecutive: dict[str, int] = defaultdict(int)
+        self._service_down_active: set[str] = set()
+        self._enterprise_last_event: dict[str, float] = {}
+        self._error_history: dict[str, deque[tuple[float, float]]] = defaultdict(lambda: deque(maxlen=5))
+
+    def _cooldown_ready(self, key: str, timestamp: float) -> bool:
+        """Check an event-time cooldown and record its firing timestamp."""
+        last = self._enterprise_last_event.get(key)
+        if last is not None and timestamp - last < self.cooldown_s:
+            return False
+        self._enterprise_last_event[key] = timestamp
+        return True
+
+    @staticmethod
+    def _enterprise_event(
+        event_type: str,
+        severity: str,
+        context: str,
+        affected_services: list[str],
+        category: str = "infra",
+    ) -> dict[str, Any]:
+        """Build a service event with only approved non-identifying context."""
+        return {
+            "type": event_type,
+            "severity": severity,
+            "count": 1,
+            "alert_context": context,
+            "category": category,
+            "affected_services": affected_services,
+        }
+
+    def _enterprise_events(
+        self,
+        host: str,
+        metrics: dict[str, Any],
+        event_time: datetime,
+    ) -> list[dict[str, Any]]:
+        """Detect service, database availability, saturation, and error-rate events."""
+        events: list[dict[str, Any]] = []
+        timestamp = event_time.timestamp()
+        if host == "postgres" and metrics.get("db_up") in (0, 0.0):
+            self._db_down_consecutive += 1
+            if self._db_down_consecutive >= 2 and not self._db_down_active and self._cooldown_ready("db_unavailable", timestamp):
+                self._db_down_active = True
+                events.append(
+                    self._enterprise_event(
+                        "db_unavailable",
+                        "high",
+                        "database unavailable",
+                        ["postgres", "banking-app", "payment-service"],
+                    )
+                )
+        elif host == "postgres" and metrics.get("db_up") in (1, 1.0):
+            self._db_down_consecutive = 0
+            if self._db_down_active:
+                self._db_down_active = False
+                events.append(
+                    self._enterprise_event(
+                        "db_recovered",
+                        "low",
+                        "database recovered",
+                        ["postgres", "banking-app", "payment-service"],
+                    )
+                )
+
+        if host in {"banking-app", "payment-service"}:
+            up = metrics.get("up")
+            if up in (0, 0.0):
+                self._service_down_consecutive[host] += 1
+                cooldown_key = f"service_down:{host}"
+                if (
+                    self._service_down_consecutive[host] >= 2
+                    and host not in self._service_down_active
+                    and self._cooldown_ready(cooldown_key, timestamp)
+                ):
+                    self._service_down_active.add(host)
+                    events.append(self._enterprise_event("service_down", "high", "service unavailable", [host]))
+            elif up in (1, 1.0):
+                self._service_down_consecutive[host] = 0
+                self._service_down_active.discard(host)
+
+        active = metrics.get("db_conn_active")
+        maximum = metrics.get("db_conn_max")
+        if (
+            isinstance(active, (int, float))
+            and not isinstance(active, bool)
+            and isinstance(maximum, (int, float))
+            and not isinstance(maximum, bool)
+            and maximum > 0
+        ):
+            ratio = active / maximum
+            if ratio >= 0.8 and self._cooldown_ready("db_conn_saturation", timestamp):
+                severity = "high" if ratio >= 0.95 else "medium"
+                events.append(
+                    self._enterprise_event(
+                        "db_conn_saturation",
+                        severity,
+                        f"database connections at {ratio * 100:.1f}% of capacity",
+                        ["postgres"],
+                    )
+                )
+
+        req_count = metrics.get("req_count")
+        err_count = metrics.get("err_count")
+        if (
+            isinstance(req_count, (int, float))
+            and not isinstance(req_count, bool)
+            and isinstance(err_count, (int, float))
+            and not isinstance(err_count, bool)
+            and req_count >= 0
+            and err_count >= 0
+        ):
+            history = self._error_history[host]
+            history.append((float(req_count), float(err_count)))
+            total_requests = sum(item[0] for item in history)
+            total_errors = sum(item[1] for item in history)
+            rate = total_errors / max(total_requests, 1.0)
+            if rate >= 0.05 and self._cooldown_ready(f"error_rate_spike:{host}", timestamp):
+                severity = "high" if rate >= 0.2 else "medium"
+                affected = [host] if host in {"banking-app", "payment-service", "postgres"} else []
+                events.append(
+                    self._enterprise_event(
+                        "error_rate_spike",
+                        severity,
+                        f"error rate {rate * 100:.1f}% over recent requests",
+                        affected,
+                    )
+                )
+        return events
 
     def _metric_events(self, host: str, metrics: dict[str, Any]) -> list[dict[str, Any]]:
         """Evaluate metrics against their local rolling baselines."""
@@ -130,6 +261,7 @@ class LocalDetector:
         events: list[dict[str, Any]] = []
         if isinstance(metrics, dict):
             events.extend(self._metric_events(host, metrics))
+            events.extend(self._enterprise_events(host, metrics, event_time))
         events.extend(self._failure_events(host, event_time, log_line))
         return events
 

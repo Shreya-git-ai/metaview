@@ -20,7 +20,13 @@ def _timestamp(moment: datetime | None = None) -> str:
     return (moment or datetime.now(timezone.utc)).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-def make_record(host: str, rng: random.Random, ts: str | None = None, **metrics: float) -> dict[str, Any]:
+def make_record(
+    host: str,
+    rng: random.Random,
+    ts: str | None = None,
+    log_line: str | None = None,
+    **metrics: float,
+) -> dict[str, Any]:
     """Build one telemetry record with realistic metric defaults."""
     values: dict[str, float] = {
         "cpu_pct": round(rng.uniform(30, 45), 1),
@@ -29,7 +35,10 @@ def make_record(host: str, rng: random.Random, ts: str | None = None, **metrics:
         "packet_loss_pct": round(max(0.0, rng.gauss(0, 0.08)), 2),
     }
     values.update(metrics)
-    return {"ts": ts or _timestamp(), "host": host, "metrics": values}
+    record: dict[str, Any] = {"ts": ts or _timestamp(), "host": host, "metrics": values}
+    if log_line is not None:
+        record["log_line"] = log_line
+    return record
 
 
 def append_record(record: dict[str, Any], stream_path: str = STREAM_PATH) -> None:
@@ -46,23 +55,31 @@ def inject(scenario: str, rng: random.Random, stream_path: str = STREAM_PATH) ->
     if scenario == "secret":
         record = make_record("srv-app-01", rng, log_line="auth ok user=rahul password=Abc@123 api_key=sk-live-9f2c81 token=eyJhbGciOi.abc.def")
         append_record(record, stream_path)
+        print(f"Appended secret scenario to {stream_path}")
     elif scenario == "cpu":
         for _ in range(5):
             append_record(make_record("srv-app-01", rng, cpu_pct=round(rng.uniform(85, 95), 1), latency_ms=round(rng.uniform(120, 180), 1)), stream_path)
+        print(f"Appended 5 cpu scenario records to {stream_path}")
     elif scenario == "fails":
         for index in range(8):
             record = make_record("srv-app-01", rng, ts=_timestamp(now + timedelta(seconds=index)), log_line="FAILED login user=admin ip=10.0.0.7")
             append_record(record, stream_path)
+        print(f"Appended 8 fails scenario records to {stream_path}")
     elif scenario == "latency":
         append_record(make_record("router-01", rng, latency_ms=round(rng.uniform(150, 300), 1), packet_loss_pct=round(rng.uniform(3, 8), 1)), stream_path)
+        print(f"Appended latency scenario to {stream_path}")
     elif scenario == "duplicate":
         path = Path(stream_path)
         lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
         if lines:
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(lines[-1] + "\n")
+            print(f"Appended duplicate record to {stream_path}")
+        else:
+            print(f"Appended no duplicate; {stream_path} has no records")
     elif scenario == "late":
         append_record(make_record("srv-app-01", rng, ts=_timestamp(now - timedelta(minutes=2))), stream_path)
+        print(f"Appended late scenario to {stream_path}")
 
 
 def run_forever(rng: random.Random, stream_path: str = STREAM_PATH) -> None:

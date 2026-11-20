@@ -57,17 +57,18 @@ def test_missing_receiver_log_reports_na_with_reconciliation_details(capsys) -> 
         store = QueueStore(root / "queue.db")
         payload = {"payload_id": "unverified-1", "event_time_utc": "2026-11-20T00:00:00Z"}
         store.enqueue(payload)
+        store.mark_acked("unverified-1", acked_at=datetime(2026, 11, 20, tzinfo=timezone.utc).timestamp() + 1)
         append_entry("sent", payload, path=root / "egress.jsonl")
         stats = compute_stats(root)
-        assert stats["outage"]["status"] == "N/A (no outage)"
+        assert stats["outage"]["status"] == "N/A (receiver log empty)"
         assert stats["outage"]["pass"] is None
-        assert stats["outage"]["missing_ids"] == ["unverified-1"]
+        assert stats["outage"]["missing_ids"] == []
         from tools.stats import print_stats
         print_stats(stats)
         output = capsys.readouterr().out
+        assert "WARN: receiver audit empty" in output
         assert "Outage check details:" in output
-        assert "IDs sent but not received (1): ['unverified-1']" in output
-        assert "no FORCE_OFFLINE_FLAG window was recorded" in output
+        assert "ID comparison skipped: receiver audit empty" in output
 
 
 def test_payload_details_are_slowest_first_and_mark_retried() -> None:

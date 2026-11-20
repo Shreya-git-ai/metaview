@@ -96,6 +96,7 @@ def compute_stats(data_dir: str | Path) -> dict[str, Any]:
     received = _read_jsonl(received_path)
 
     acked_rows = [row for row in outbox if row["status"] == "acked" and row.get("acked_at") is not None]
+    acked_count = sum(1 for row in outbox if row["status"] == "acked")
     durations: list[float] = []
     grouped_durations: dict[str, list[float]] = {"metrics": [], "incident_events": []}
     for row in acked_rows:
@@ -117,9 +118,11 @@ def compute_stats(data_dir: str | Path) -> dict[str, Any]:
     sent_ids.discard(None)
     received_list = [entry.get("payload_id") for entry in received if isinstance(entry.get("payload_id"), str)]
     received_ids = set(received_list)
-    missing_ids = sent_ids - received_ids
-    unsent_received_ids = received_ids - sent_ids
-    duplicate_count = len(received_list) - len(received_ids)
+    receiver_audit_empty = not received
+    outage_comparison_performed = not (receiver_audit_empty and acked_count > 0)
+    missing_ids = sent_ids - received_ids if outage_comparison_performed else set()
+    unsent_received_ids = received_ids - sent_ids if outage_comparison_performed else set()
+    duplicate_count = len(received_list) - len(received_ids) if outage_comparison_performed else 0
     outage_pass = not missing_ids and not unsent_received_ids and duplicate_count == 0
     receiver_log_available = received_path.exists()
     offline_flag_path = Path(config.FORCE_OFFLINE_FLAG)
@@ -140,6 +143,21 @@ def compute_stats(data_dir: str | Path) -> dict[str, Any]:
         if secret in egress_text or secret in outbox_text
     ]
     statuses = {name: sum(1 for row in outbox if row["status"] == name) for name in ("acked", "rejected")}
+    if not outage_comparison_performed:
+        outage_status = "N/A (receiver log empty)"
+        outage_reason = "no receiver audit rows are available despite acknowledged payloads"
+    elif not receiver_log_available and not offline_window_occurred:
+        outage_status = "N/A (no outage)"
+        outage_reason = "no FORCE_OFFLINE_FLAG window was recorded"
+    elif not receiver_log_available:
+        outage_status = "N/A (received log unavailable)"
+        outage_reason = "data/received.jsonl is absent; receiver IDs cannot be compared"
+    elif not offline_window_occurred:
+        outage_status = "N/A (no outage)"
+        outage_reason = "no FORCE_OFFLINE_FLAG window was recorded"
+    else:
+        outage_status = "PASS" if outage_pass else "FAIL"
+        outage_reason = None
     result: dict[str, Any] = {
         "payloads_created": len(outbox),
         "acked": statuses["acked"],
@@ -169,15 +187,11 @@ def compute_stats(data_dir: str | Path) -> dict[str, Any]:
             "unsent_received_ids": sorted(unsent_received_ids),
             "duplicate_count": duplicate_count,
             "receiver_log_available": receiver_log_available,
-            "status": (
-                ("PASS" if outage_pass else "FAIL") if receiver_log_available and offline_window_occurred
-                else ("N/A (no outage)" if not offline_window_occurred else "N/A (received log unavailable)")
-            ),
-            "reason": (
-                None if receiver_log_available and offline_window_occurred
-                else ("no FORCE_OFFLINE_FLAG window was recorded" if not offline_window_occurred else "data/received.jsonl is absent; receiver IDs cannot be compared")
-            ),
-            "pass": outage_pass if receiver_log_available and offline_window_occurred else None,
+            "status": outage_status,
+            "reason": outage_reason,
+            "pass": outage_pass if outage_comparison_performed and receiver_log_available and offline_window_occurred else None,
+            "receiver_audit_empty": receiver_audit_empty,
+            "comparison_performed": outage_comparison_performed,
             "force_offline_flag_present": offline_flag_path.exists(),
             "force_offline_window_occurred": offline_window_occurred,
             "offline_window_history_available": any(path.exists() for path in offline_window_logs),
@@ -222,11 +236,16 @@ def print_stats(stats: dict[str, Any]) -> None:
         timing = stats["delivery"]["by_payload_type"][group]
         print(f"Delivery {label} p50/p95 (s): {timing['p50_seconds']} / {timing['p95_seconds']} (n={timing['sample_count']})")
     outage = stats["outage"]
+    if stats["acked"] > 0 and outage["receiver_audit_empty"]:
+        print("WARN: receiver audit empty")
     print("Outage check details:")
     print(f"  Sent IDs: {outage['sent_count']}")
     print(f"  Received IDs: {outage['received_count']}")
-    print(f"  IDs sent but not received ({outage['missing_count']}): {outage['missing_ids']}")
-    print(f"  IDs received but not sent ({outage['unsent_received_count']}): {outage['unsent_received_ids']}")
+    if outage["comparison_performed"]:
+        print(f"  IDs sent but not received ({outage['missing_count']}): {outage['missing_ids']}")
+        print(f"  IDs received but not sent ({outage['unsent_received_count']}): {outage['unsent_received_ids']}")
+    else:
+        print("  ID comparison skipped: receiver audit empty")
     print(f"  Duplicates: {outage['duplicate_count']}")
     if outage["reason"]:
         print(f"  Reason: {outage['reason']}")

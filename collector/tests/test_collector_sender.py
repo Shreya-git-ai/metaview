@@ -159,7 +159,7 @@ def test_restart_resumes_offset_without_duplicate_or_lost_records() -> None:
 def test_offline_queue_drains_in_event_order_and_heartbeat_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
     with tempfile.TemporaryDirectory() as directory:
         stream, db, egress, audit = _paths(directory)
-        offline = Path(directory) / "force_offline"
+        offline = Path(directory) / "FORCE_OFFLINE_FLAG"
         offline.touch()
         for index in range(20):
             append_record(_record(index), str(stream))

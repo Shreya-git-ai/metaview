@@ -5,5 +5,6 @@ $ErrorActionPreference = "Stop"
 # Terminal 2: .\..\venv\Scripts\python.exe tools\dummy_ingest.py
 # Terminal 3: $env:INGEST_URL='http://127.0.0.1:8000/ingest'; $env:HEARTBEAT_URL='http://127.0.0.1:8000/heartbeat'; .\..\venv\Scripts\python.exe collector.py
 # Terminal 4: .\..\venv\Scripts\python.exe egress_panel.py (open http://127.0.0.1:5000)
+# Offline replay: New-Item -ItemType File data\FORCE_OFFLINE_FLAG; remove it with Remove-Item data\FORCE_OFFLINE_FLAG
 
 Write-Host "Open separate terminals in collector/ and run the commands in this file's comments."

@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+# generated secrets / runtime data — never commit
+config/*.env
+certificates/
+data/
+logs/
+frontend/node_modules/
+frontend/dist/
+frontend/dist-local/
+*.log

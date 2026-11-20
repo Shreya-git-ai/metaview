@@ -78,6 +78,20 @@ class QueueStore:
         sequence = connection.execute("SELECT value FROM counters WHERE key = 'payload_sequence'").fetchone()[0]
         return f"{self.collector_id}-{sequence:06d}"
 
+    def reserve_payload_id(self) -> str:
+        """Atomically reserve and persist the next payload ID."""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            payload_id = self._next_payload_id(connection)
+            connection.commit()
+            return payload_id
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @staticmethod
     def _insert_payload(
         connection: sqlite3.Connection,
@@ -137,6 +151,31 @@ class QueueStore:
             connection.execute("UPDATE counters SET value = ? WHERE key = 'stream_offset'", (new_offset,))
             connection.commit()
             return payload_id
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def enqueue_many_with_offset(self, payloads: list[dict[str, Any]], new_offset: int) -> int:
+        """Atomically insert already-IDed payloads and update the stream offset."""
+        if not isinstance(payloads, list) or any(not isinstance(payload, dict) for payload in payloads):
+            raise TypeError("payloads must be a list of dictionaries")
+        if isinstance(new_offset, bool) or not isinstance(new_offset, int) or new_offset < 0:
+            raise ValueError("new_offset must be a non-negative integer")
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            inserted = 0
+            for payload in payloads:
+                payload_id = payload.get("payload_id")
+                if not isinstance(payload_id, str) or not payload_id:
+                    raise ValueError("every payload must contain a non-empty payload_id")
+                if self._insert_payload(connection, payload, payload_id, time.time()):
+                    inserted += 1
+            connection.execute("UPDATE counters SET value = ? WHERE key = 'stream_offset'", (new_offset,))
+            connection.commit()
+            return inserted
         except Exception:
             connection.rollback()
             raise
@@ -247,6 +286,16 @@ def enqueue(payload: dict[str, Any]) -> str:
 def enqueue_with_offset(payload: dict[str, Any], new_offset: int) -> str:
     """Atomically insert a payload and byte offset into the default store."""
     return _DEFAULT_STORE.enqueue_with_offset(payload, new_offset)
+
+
+def reserve_payload_id() -> str:
+    """Reserve an ID from the default queue store."""
+    return _DEFAULT_STORE.reserve_payload_id()
+
+
+def enqueue_many_with_offset(payloads: list[dict[str, Any]], new_offset: int) -> int:
+    """Atomically enqueue a batch and stream offset in the default store."""
+    return _DEFAULT_STORE.enqueue_many_with_offset(payloads, new_offset)
 
 
 def get_offset() -> int:

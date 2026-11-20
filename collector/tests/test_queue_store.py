@@ -119,3 +119,53 @@ def test_stats_count_pending_acked_rejected_and_total() -> None:
         store.mark_rejected(rejected)
         assert store.pending_count() == 2
         assert store.stats() == {"pending": 2, "acked": 1, "rejected": 1, "total": 4}
+
+
+def test_reserved_ids_are_unique_and_continue_after_restart() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "queue.db"
+        first = QueueStore(path, collector_id="reserve")
+        reserved = [first.reserve_payload_id(), first.reserve_payload_id()]
+        reopened = QueueStore(path, collector_id="reserve")
+        reserved.append(reopened.reserve_payload_id())
+        assert reserved == ["reserve-000001", "reserve-000002", "reserve-000003"]
+
+
+def test_enqueue_many_saves_payloads_and_offset_atomically() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = QueueStore(Path(directory) / "queue.db")
+        payloads = [
+            _payload(payload_id="batch-1"),
+            _payload("2026-11-20T10:01:00Z", payload_id="batch-2"),
+        ]
+        assert store.enqueue_many_with_offset(payloads, 900) == 2
+        assert store.pending_count() == 2
+        assert store.get_offset() == 900
+
+
+def test_enqueue_many_failure_saves_no_payloads_or_offset() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = QueueStore(Path(directory) / "queue.db")
+        payloads = [
+            _payload(payload_id="will-rollback"),
+            _payload("2026-11-20T10:01:00Z", payload_id="will-fail", bad=object()),
+        ]
+        try:
+            store.enqueue_many_with_offset(payloads, 1234)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("non-serializable second row should fail")
+        assert store.stats()["total"] == 0
+        assert store.get_offset() == 0
+
+
+def test_unenqueued_reserved_id_is_only_a_gap() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        store = QueueStore(Path(directory) / "queue.db", collector_id="gap")
+        reserved = store.reserve_payload_id()
+        next_id = store.reserve_payload_id()
+        store.enqueue(_payload(payload_id=next_id))
+        assert reserved == "gap-000001"
+        assert next_id == "gap-000002"
+        assert [row["payload_id"] for row in store.next_batch()] == ["gap-000002"]

@@ -181,6 +181,7 @@ def test_offline_queue_drains_in_event_order_and_heartbeat_is_skipped(monkeypatc
         time.sleep(0.15)
         assert requests_seen == []
         assert store.pending_count() == 20
+        assert (Path(directory) / "offline_windows.jsonl").exists()
         offline.unlink()
         deadline = time.time() + 5
         while store.pending_count() and time.time() < deadline:
@@ -289,8 +290,10 @@ def test_100_pending_payloads_drain_against_dummy_ingest_under_10_seconds() -> N
         worker.start()
         try:
             deadline = started + 10
+            while app.extensions["accepted_count"] < 100 and time.perf_counter() < deadline:
+                time.sleep(0.05)
             while store.pending_count() and time.perf_counter() < deadline:
-                time.sleep(0.01)
+                time.sleep(0.05)
             elapsed = time.perf_counter() - started
             stop_event.set()
             worker.join(timeout=2)

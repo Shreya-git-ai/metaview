@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import logging
+import json
 import threading
 import time
 from datetime import datetime, timezone
@@ -52,6 +53,7 @@ class Sender:
         self._auth_failed = False
         self._session: requests.Session | None = None
         self._failure_backoff_s = self.backoff_base_s
+        self._offline_window_active = False
 
     def _get_session(self) -> requests.Session:
         """Create one keep-alive session lazily in the thread that sends."""
@@ -138,6 +140,17 @@ class Sender:
         finally:
             session.close()
 
+    def _record_offline_window(self) -> None:
+        """Record a local marker when the demo offline flag becomes active."""
+        log_path = self.offline_flag.parent / "offline_windows.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "event": "force_offline_started",
+            "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
     def _send_heartbeat(self, session: requests.Session) -> bool:
         """Send a heartbeat with short timeouts using the heartbeat worker session."""
         payload = {
@@ -178,7 +191,14 @@ class Sender:
         heartbeat_thread.start()
         try:
             while not self.stop_event.is_set():
-                if self.offline_flag.exists() or self._auth_failed:
+                if self.offline_flag.exists():
+                    if not self._offline_window_active:
+                        self._record_offline_window()
+                        self._offline_window_active = True
+                    self.stop_event.wait(config.SENDER_IDLE_S)
+                    continue
+                self._offline_window_active = False
+                if self._auth_failed:
                     self.stop_event.wait(config.SENDER_IDLE_S)
                     continue
                 rows = self.store.next_batch(50)

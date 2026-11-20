@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import egress_log
 from egress_log import append_entry, verify_chain, write_redaction_audit
 
 
@@ -67,6 +68,7 @@ def test_restart_resumes_sequence_and_hash_chain() -> None:
         path = Path(directory) / "egress.jsonl"
         append_entry("queued", _payload(1), path=path)
         append_entry("sent", _payload(1), path=path)
+        egress_log._APPEND_STATE.pop(path.resolve())
         restarted_entry = append_entry("acked", _payload(1), path=path)
         assert restarted_entry["seq"] == 3
         assert verify_chain(path)

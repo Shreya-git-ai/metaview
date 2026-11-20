@@ -80,3 +80,34 @@ def test_health_hint_cases() -> None:
     assert health_hint({"cpu_pct": 40}, [{"type": "cpu_anomaly", "severity": "low"}]) == "Good"
     assert health_hint({"cpu_pct": 40}) == "Excellent"
     assert health_hint({"cpu_pct": 40}, [{"severity": "critical"}]) == "Poor"
+
+
+def test_db_down_requires_two_records_and_recovers_once() -> None:
+    detector = LocalDetector()
+    down_one = detector.process("postgres", {"db_up": 0}, None, _ts(0))
+    down_two = detector.process("postgres", {"db_up": 0}, None, _ts(1))
+    down_three = detector.process("postgres", {"db_up": 0}, None, _ts(2))
+    recovered = detector.process("postgres", {"db_up": 1}, None, _ts(3))
+    still_up = detector.process("postgres", {"db_up": 1}, None, _ts(4))
+    db_events = [event for event in down_one + down_two + down_three + recovered + still_up if event["type"].startswith("db_")]
+    assert [event["type"] for event in db_events] == ["db_unavailable", "db_recovered"]
+    assert db_events[0]["severity"] == "high"
+    assert db_events[0]["affected_services"] == ["postgres", "banking-app", "payment-service"]
+    assert db_events[1]["severity"] == "low"
+    assert db_events[1]["alert_context"] == "database recovered"
+    assert "postgres" not in db_events[0]["alert_context"]
+
+
+def test_service_down_saturation_and_error_rate_detectors() -> None:
+    detector = LocalDetector()
+    assert detector.process("banking-app", {"up": 0}, None, _ts(0)) == []
+    down = detector.process("banking-app", {"up": 0}, None, _ts(1))
+    assert len(down) == 1 and down[0]["type"] == "service_down"
+    assert down[0]["affected_services"] == ["banking-app"]
+    saturated = detector.process("postgres", {"db_conn_active": 96, "db_conn_max": 100}, None, _ts(2))
+    assert len(saturated) == 1 and saturated[0]["severity"] == "high"
+    error_events = []
+    for index in range(5):
+        error_events.extend(detector.process("payment-service", {"req_count": 100, "err_count": 10}, None, _ts(index + 3)))
+    spikes = [event for event in error_events if event["type"] == "error_rate_spike"]
+    assert len(spikes) == 1 and spikes[0]["severity"] == "medium"

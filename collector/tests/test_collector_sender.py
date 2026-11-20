@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import tempfile
 import threading
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 import requests
+from werkzeug.serving import make_server
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -46,6 +48,18 @@ def _mock_server(app: Any):
         return _Response(response)
 
     return post
+
+
+def _patch_session(monkeypatch: pytest.MonkeyPatch, post: Any) -> None:
+    """Give Sender a requests.Session-shaped object backed by the test handler."""
+    class _Session:
+        def post(self, url: str, **kwargs: Any) -> Any:
+            return post(url, **kwargs)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sender_module.requests, "Session", _Session)
 
 
 def _paths(directory: str) -> tuple[Path, Path, Path, Path]:
@@ -101,7 +115,7 @@ def test_end_to_end_normal_records_and_secret_are_acked_without_raw_leaks(monkey
         assert collector.poll_once() == 41
         assert store.stats()["pending"] >= 42
         app = create_app("dev-key-change-me", Path(directory) / "received.jsonl")
-        monkeypatch.setattr(sender_module.requests, "post", _mock_server(app))
+        _patch_session(monkeypatch, _mock_server(app))
         sender = Sender(store, threading.Event(), offline_flag=Path(directory) / "offline", egress_path=egress)
         _drain(sender, store)
         assert store.stats()["pending"] == 0
@@ -145,7 +159,7 @@ def test_restart_resumes_offset_without_duplicate_or_lost_records() -> None:
 def test_offline_queue_drains_in_event_order_and_heartbeat_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
     with tempfile.TemporaryDirectory() as directory:
         stream, db, egress, audit = _paths(directory)
-        offline = Path(directory) / "force_offline"
+        offline = Path(directory) / "FORCE_OFFLINE_FLAG"
         offline.touch()
         for index in range(20):
             append_record(_record(index), str(stream))
@@ -159,7 +173,7 @@ def test_offline_queue_drains_in_event_order_and_heartbeat_is_skipped(monkeypatc
             requests_seen.append(url)
             return _mock_server(app)(url, **kwargs)
 
-        monkeypatch.setattr(sender_module.requests, "post", tracked_post)
+        _patch_session(monkeypatch, tracked_post)
         stop_event = threading.Event()
         sender = Sender(store, stop_event, offline_flag=offline, egress_path=egress, heartbeat_s=0.01)
         thread = threading.Thread(target=sender.run)
@@ -167,6 +181,7 @@ def test_offline_queue_drains_in_event_order_and_heartbeat_is_skipped(monkeypatc
         time.sleep(0.15)
         assert requests_seen == []
         assert store.pending_count() == 20
+        assert (Path(directory) / "offline_windows.jsonl").exists()
         offline.unlink()
         deadline = time.time() + 5
         while store.pending_count() and time.time() < deadline:
@@ -202,7 +217,7 @@ def test_timeout_retry_reuses_id_and_duplicate_reply_is_success(monkeypatch: pyt
                 raise requests.Timeout("simulated timeout after server accepted")
             return response
 
-        monkeypatch.setattr(sender_module.requests, "post", timeout_after_accept)
+        _patch_session(monkeypatch, timeout_after_accept)
         sender = Sender(store, threading.Event(), offline_flag=Path(directory) / "offline", egress_path=egress)
         row = store.next_batch(1)[0]
         assert sender.send_one(row)[0] == "retry"
@@ -242,3 +257,52 @@ def test_malformed_complete_line_advances_count_and_offset() -> None:
         assert collector.poll_once() == 1
         assert collector.malformed_count == 1
         assert collector.store.get_offset() == stream.stat().st_size
+
+
+def test_100_pending_payloads_drain_against_dummy_ingest_under_10_seconds() -> None:
+    """A real local HTTP server verifies the sustained batch-drain path."""
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        store = QueueStore(root / "queue.db", collector_id="speed")
+        for index in range(100):
+            store.enqueue({
+                "payload_id": f"speed-{index:06d}",
+                "event_time_utc": f"2026-11-20T10:{index // 60:02d}:{index % 60:02d}Z",
+                "category": "infra",
+            })
+        app = create_app(received_path=root / "received.jsonl")
+        server = make_server("127.0.0.1", 0, app, threaded=True)
+        server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+        server_thread.start()
+        old_level = logging.getLogger("werkzeug").level
+        logging.getLogger("werkzeug").setLevel(logging.ERROR)
+        stop_event = threading.Event()
+        sender = Sender(
+            store,
+            stop_event,
+            ingest_url=f"http://127.0.0.1:{server.server_port}/ingest",
+            offline_flag=root / "offline",
+            egress_path=root / "egress.jsonl",
+            heartbeat_s=3600,
+        )
+        worker = threading.Thread(target=sender.run)
+        started = time.perf_counter()
+        worker.start()
+        try:
+            deadline = started + 10
+            while app.extensions["accepted_count"] < 100 and time.perf_counter() < deadline:
+                time.sleep(0.05)
+            while store.pending_count() and time.perf_counter() < deadline:
+                time.sleep(0.05)
+            elapsed = time.perf_counter() - started
+            stop_event.set()
+            worker.join(timeout=2)
+            assert store.stats()["acked"] == 100
+            assert app.extensions["accepted_count"] == 100
+            assert elapsed < 10, f"100 payloads took {elapsed:.3f}s"
+        finally:
+            stop_event.set()
+            worker.join(timeout=2)
+            server.shutdown()
+            server_thread.join(timeout=2)
+            logging.getLogger("werkzeug").setLevel(old_level)

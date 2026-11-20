@@ -10,8 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-COLLECTOR_DIR = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(COLLECTOR_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from allowlist import apply_allowlist, build_payload
 from generator import append_record, inject, make_record

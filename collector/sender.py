@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import logging
+import json
 import threading
 import time
 from datetime import datetime, timezone
@@ -50,6 +51,15 @@ class Sender:
         self._last_heartbeat = 0.0
         self._rng = random.Random()
         self._auth_failed = False
+        self._session: requests.Session | None = None
+        self._failure_backoff_s = self.backoff_base_s
+        self._offline_window_active = False
+
+    def _get_session(self) -> requests.Session:
+        """Create one keep-alive session lazily in the thread that sends."""
+        if self._session is None:
+            self._session = requests.Session()
+        return self._session
 
     def _verify_setting(self) -> bool | str:
         """Choose an explicit CA bundle when configured, otherwise TLS boolean."""
@@ -63,10 +73,12 @@ class Sender:
         """Append a status entry without including request or raw-stream content."""
         append_entry(status, payload, path=self.egress_path)
 
-    def _backoff(self, attempts_before_send: int) -> float:
-        """Return capped exponential delay with bounded random jitter."""
-        base = min(self.backoff_max_s, self.backoff_base_s * (2 ** min(attempts_before_send, 30)))
-        return min(self.backoff_max_s, base * (1 + self._rng.uniform(0, max(0.0, self.jitter_fraction))))
+    def _backoff(self) -> float:
+        """Return this failure's delay, then grow the next delay to its cap."""
+        base = min(self.backoff_max_s, self._failure_backoff_s)
+        delay = min(self.backoff_max_s, base * (1 + self._rng.uniform(0, max(0.0, self.jitter_fraction))))
+        self._failure_backoff_s = min(self.backoff_max_s, max(self.backoff_base_s, base * 2))
+        return delay
 
     def send_one(self, row: dict[str, Any]) -> tuple[str, float]:
         """Attempt one payload; return result and retry delay when applicable."""
@@ -75,16 +87,16 @@ class Sender:
         self.store.mark_attempt(payload_id)
         self._log("sent", body)
         try:
-            response = requests.post(
+            response = self._get_session().post(
                 self._endpoint(),
                 json=body,
                 headers={"X-API-Key": config.API_KEY},
-                timeout=config.SEND_TIMEOUT_S,
+                timeout=(3.0, 5.0),
                 verify=self._verify_setting(),
             )
         except requests.RequestException:
             self._log("retried", body)
-            return "retry", self._backoff(int(row.get("attempts", 0)))
+            return "retry", self._backoff()
 
         status_code = int(response.status_code)
         if status_code == 200:
@@ -95,12 +107,13 @@ class Sender:
             if response_status in {"accepted", "duplicate"}:
                 self.store.mark_acked(payload_id)
                 self._log("acked", body)
+                self._failure_backoff_s = self.backoff_base_s
                 return "acked", 0.0
             self._log("retried", body)
-            return "retry", self._backoff(int(row.get("attempts", 0)))
+            return "retry", self._backoff()
         if status_code == 429 or status_code >= 500:
             self._log("retried", body)
-            return "retry", self._backoff(int(row.get("attempts", 0)))
+            return "retry", self._backoff()
         if 400 <= status_code < 500:
             self.store.mark_rejected(payload_id)
             self._log("rejected", body)
@@ -109,10 +122,37 @@ class Sender:
                 _LOGGER.error("Ingest authentication failed; sender paused and queued data retained")
             return "rejected", 0.0
         self._log("retried", body)
-        return "retry", self._backoff(int(row.get("attempts", 0)))
+        return "retry", self._backoff()
 
-    def send_heartbeat(self) -> bool:
-        """Send the current queue depth and basic collector heartbeat metadata."""
+    def _heartbeat_loop(self) -> None:
+        """Send heartbeats independently so a slow endpoint cannot stall draining."""
+        session = requests.Session()
+        due = time.monotonic() + max(self.heartbeat_s, 0.05)
+        try:
+            while not self.stop_event.is_set():
+                remaining = due - time.monotonic()
+                if remaining > 0:
+                    self.stop_event.wait(min(remaining, 0.1))
+                    continue
+                if not self.offline_flag.exists():
+                    self._send_heartbeat(session)
+                due = time.monotonic() + max(self.heartbeat_s, 0.05)
+        finally:
+            session.close()
+
+    def _record_offline_window(self) -> None:
+        """Record a local marker when the demo offline flag becomes active."""
+        log_path = self.offline_flag.parent / "offline_windows.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "event": "force_offline_started",
+            "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+        }
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n")
+
+    def _send_heartbeat(self, session: requests.Session) -> bool:
+        """Send a heartbeat with short timeouts using the heartbeat worker session."""
         payload = {
             "collector_id": config.COLLECTOR_ID,
             "tenant_id": config.TENANT_ID,
@@ -124,11 +164,11 @@ class Sender:
             "config_status": "ok",
         }
         try:
-            response = requests.post(
+            response = session.post(
                 self.heartbeat_url,
                 json=payload,
                 headers={"X-API-Key": config.API_KEY},
-                timeout=config.SEND_TIMEOUT_S,
+                timeout=(0.5, 1.0),
                 verify=self._verify_setting(),
             )
             self._last_heartbeat = time.monotonic()
@@ -141,30 +181,41 @@ class Sender:
             _LOGGER.warning("Heartbeat request failed")
             return False
 
+    def send_heartbeat(self) -> bool:
+        """Send the current queue depth and basic collector heartbeat metadata."""
+        return self._send_heartbeat(self._get_session())
+
     def run(self) -> None:
         """Drain pending rows and heartbeat until the stop event is set."""
-        while not self.stop_event.is_set():
-            if self.offline_flag.exists():
-                self.stop_event.wait(0.2)
-                continue
-            if self._auth_failed:
-                self.stop_event.wait(0.5)
-                continue
-            if time.monotonic() - self._last_heartbeat >= self.heartbeat_s:
-                self.send_heartbeat()
-                if self.stop_event.wait(0.01):
-                    break
-            rows = self.store.next_batch(100)
-            if not rows:
-                self.stop_event.wait(min(max(self.heartbeat_s / 4, 0.05), 0.5))
-                continue
-            for row in rows:
-                if self.stop_event.is_set() or self.offline_flag.exists():
-                    break
-                outcome, delay = self.send_one(row)
-                if outcome == "retry":
-                    self.stop_event.wait(delay)
-                    break
+        heartbeat_thread = threading.Thread(target=self._heartbeat_loop, name="collector-heartbeat", daemon=True)
+        heartbeat_thread.start()
+        try:
+            while not self.stop_event.is_set():
+                if self.offline_flag.exists():
+                    if not self._offline_window_active:
+                        self._record_offline_window()
+                        self._offline_window_active = True
+                    self.stop_event.wait(config.SENDER_IDLE_S)
+                    continue
+                self._offline_window_active = False
+                if self._auth_failed:
+                    self.stop_event.wait(config.SENDER_IDLE_S)
+                    continue
+                rows = self.store.next_batch(50)
+                if not rows:
+                    self.stop_event.wait(config.SENDER_IDLE_S)
+                    continue
+                for row in rows:
+                    if self.stop_event.is_set() or self.offline_flag.exists() or self._auth_failed:
+                        break
+                    outcome, delay = self.send_one(row)
+                    if outcome == "retry":
+                        self.stop_event.wait(delay)
+                        break
+        finally:
+            heartbeat_thread.join(timeout=1.5)
+            if self._session is not None:
+                self._session.close()
 
 
 def sender_loop(store: QueueStore, stop_event: threading.Event, **kwargs: Any) -> None:

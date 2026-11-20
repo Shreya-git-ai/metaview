@@ -15,6 +15,7 @@ REDACTION_AUDIT_PATH = DATA_DIR / "redaction_audit.jsonl"
 _APPEND_LOCK = threading.Lock()
 _ZERO_HASH = "0" * 64
 _STATUSES = {"queued", "sent", "retried", "acked", "blocked", "rejected"}
+_APPEND_STATE: dict[Path, tuple[int, str, int]] = {}
 
 
 def _canonical_json(value: Any) -> str:
@@ -36,6 +37,22 @@ def _last_state(path: Path) -> tuple[int, str]:
         return 0, _ZERO_HASH
 
 
+def _append_state(path: Path) -> tuple[int, str]:
+    """Use cached chain state unless the file changed outside this process."""
+    key = path.resolve()
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        _APPEND_STATE.pop(key, None)
+        return 0, _ZERO_HASH
+    cached = _APPEND_STATE.get(key)
+    if cached is not None and cached[2] == size:
+        return cached[0], cached[1]
+    state = _last_state(path)
+    _APPEND_STATE[key] = (state[0], state[1], size)
+    return state
+
+
 def append_entry(
     status: str,
     payload: dict[str, Any],
@@ -52,7 +69,8 @@ def append_entry(
     payload_sha256 = hashlib.sha256(_canonical_json(payload_copy).encode("utf-8")).hexdigest()
     with _APPEND_LOCK:
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        seq, prev_hash = _last_state(log_path)
+        key = log_path.resolve()
+        seq, prev_hash = _append_state(log_path)
         entry: dict[str, Any] = {
             "seq": seq + 1,
             "ts_utc": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
@@ -66,6 +84,7 @@ def append_entry(
         }
         with log_path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n")
+        _APPEND_STATE[key] = (entry["seq"], entry["entry_hash"], log_path.stat().st_size)
         return entry
 
 

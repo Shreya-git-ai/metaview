@@ -38,8 +38,6 @@ class QueueStore:
         )
         connection.row_factory = sqlite3.Row
         connection.execute(f"PRAGMA busy_timeout = {int(self.busy_timeout_ms)}")
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("PRAGMA synchronous = FULL")
         return connection
 
     def _initialize(self) -> None:
@@ -47,6 +45,8 @@ class QueueStore:
         with self._initialize_lock:
             connection = self._connect()
             try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA synchronous = FULL")
                 connection.executescript(
                     """
                     CREATE TABLE IF NOT EXISTS outbox (

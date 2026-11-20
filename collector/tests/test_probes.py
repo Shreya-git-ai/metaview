@@ -62,7 +62,14 @@ def test_mock_db_down_probe_produces_acked_db_event(monkeypatch) -> None:
             path = "/heartbeat" if url.endswith("/heartbeat") else "/ingest"
             return _Response(client.post(path, json=kwargs.get("json"), headers=kwargs.get("headers", {})))
 
-        monkeypatch.setattr(sender_module.requests, "post", post)
+        class _Session:
+            def post(self, url: str, **kwargs: Any) -> _Response:
+                return post(url, **kwargs)
+
+            def close(self) -> None:
+                return None
+
+        monkeypatch.setattr(sender_module.requests, "Session", _Session)
         sender = Sender(store, threading.Event(), offline_flag=root / "offline", egress_path=egress)
         while store.pending_count():
             outcome, _ = sender.send_one(store.next_batch(1)[0])
